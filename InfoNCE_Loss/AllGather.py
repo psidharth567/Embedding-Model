@@ -25,12 +25,10 @@ class AllGather(torch.autograd.Function):
         #     None,
         # )
 
-    # GPT-5-thinking-high suggested to use reduce-scatter instead of all gather and its correct.
-    # Reduce Scatter is much more efficient than AllReduce here and ReduceScatter and AllGather are inverse operations of each-other. It's more efficient to use ReduceScatter
-    # https://jax-ml.github.io/scaling-book/sharding/
-
-    @staticmethod
-    def backward(ctx, grad_output):
+        # GPT-5-thinking-high suggested to use reduce-scatter instead of all gather and its correct.
+        # Reduce Scatter is much more efficient than AllReduce here and ReduceScatter and AllGather are inverse operations of each-other. It's more efficient to use ReduceScatter
+        # https://jax-ml.github.io/scaling-book/sharding/
+        
         # local shard after reduction
         local = grad_output.narrow(0, ctx.local_batch_size * ctx.rank, ctx.local_batch_size)
         out = torch.empty_like(local)
