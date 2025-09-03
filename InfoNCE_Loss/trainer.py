@@ -17,6 +17,13 @@ from transformers import AutoTokenizer
 from torch.optim import AdamW
 import inspect
 import wandb
+# Add to imports
+try:
+    import deepspeed
+    from deepspeed import DeepSpeedConfig
+    DEEPSPEED_AVAILABLE = True
+except ImportError:
+    DEEPSPEED_AVAILABLE = False
 # --------------------------------------------------------------------------- #
 # Import the learner & backbone
 # --------------------------------------------------------------------------- #
@@ -489,16 +496,67 @@ def main(cfg):
     if "fused" in inspect.signature(AdamW.__init__).parameters:
         opt_kwargs["fused"] = torch.cuda.is_available()
 
-    opt = AdamW(params, **opt_kwargs)
+    if DEEPSPEED_AVAILABLE and cfg.use_deepspeed:
+    # DeepSpeed configuration WITHOUT scheduler (we'll use custom WSD)
+        ds_config = {
+            "zero_optimization": {
+                "stage": 2,
+                "offload_optimizer": {
+                    "device": "cpu",
+                    "pin_memory": True
+                },
+                "allgather_partitions": True,
+                "reduce_scatter": True,
+                "overlap_comm": True,
+            },
+            "gradient_clipping": 1.0,
+            "train_batch_size": cfg.batch_size * cfg.accum * world_size,
+            "gradient_accumulation_steps": cfg.accum,
+            "optimizer": {
+                "type": "AdamW",
+                "params": {
+                    "lr": cfg.lr,
+                    "betas": (0.9, 0.98),
+                    "eps": 1e-8,
+                    "weight_decay": cfg.wd
+                }
+            },
+           
+            "fp16": {
+                "enabled": False
+            },
+            "bf16": {
+                "enabled": True
+            }
+        }
+        
+        # Initialize DeepSpeed with optimizer but without scheduler
+        learner, opt, _, _ = deepspeed.initialize(
+            model=learner,
+            model_parameters=params,
+            config=ds_config
+        )
+        
+        # Create custom WSD scheduler for DeepSpeed
+        total_steps = math.ceil(len(dl) * cfg.epochs / cfg.accum)
+        sched = build_wsd_scheduler(opt, total_steps,
+        warmup_ratio=cfg.warmup_ratio,
+        stable_ratio=cfg.stable_ratio,
+        min_lr_ratio=cfg.min_lr_ratio,
+        decay=cfg.decay_style
+        )
 
-    total_steps  = math.ceil(len(dl)*cfg.epochs / cfg.accum)
+    else:
+        opt = AdamW(params, **opt_kwargs)
 
-    sched = build_wsd_scheduler(
-                opt, total_steps,
-                warmup_ratio=cfg.warmup_ratio,
-                stable_ratio=cfg.stable_ratio,
-                min_lr_ratio=cfg.min_lr_ratio,
-                decay=cfg.decay_style) # We use a warmup-stable-decay scheduler
+        total_steps  = math.ceil(len(dl)*cfg.epochs / cfg.accum)
+
+        sched = build_wsd_scheduler(
+                    opt, total_steps,
+                    warmup_ratio=cfg.warmup_ratio,
+                    stable_ratio=cfg.stable_ratio,
+                    min_lr_ratio=cfg.min_lr_ratio,
+                    decay=cfg.decay_style) # We use a warmup-stable-decay scheduler
 
     # ---------- checkpoint schedule ----------
     total_updates = total_steps
@@ -594,7 +652,10 @@ def main(cfg):
 
             did_update = False
             if step % cfg.accum == 0:
-                torch.nn.utils.clip_grad_norm_(learner.parameters(), 1.0)
+                if not (DEEPSPEED_AVAILABLE and cfg.use_deepspeed):
+                    # We don't need to clip grads if we're using DeepSpeed
+                    torch.nn.utils.clip_grad_norm_(learner.parameters(), 1.0)
+
                 opt.step()
                 sched.step()
                 opt.zero_grad(set_to_none=True)
@@ -689,6 +750,9 @@ if __name__ == "__main__":
     p.add_argument("--wandb_run_name", type=str, default=None,
                    help="Wandb run name (if None, will use auto-generated name)")
 
+    # DeepSpeed arguments
+    p.add_argument("--use_deepspeed", action="store_true",
+               help="Use DeepSpeed for optimizer offloading")
 
     cfg = p.parse_args()
     main(cfg) 
